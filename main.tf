@@ -1,87 +1,140 @@
-# main.tf
-# Root orchestrator: wires modules together. Keep logic minimal here:
-# - Calls modules (networking, gke-cluster, node-pools, tidb)
-# - Configures Kubernetes/Helm/Kubectl providers after cluster creation
-# Note: Modules live in ./modules/*
+## Root main.tf
+## Calls the network, GKE cluster, and TiDB application modules.
 
-module "networking" {
-  source = "./modules/networking"
-
-  project_id         = var.project_id
-  region             = var.region
-  zone               = var.zone
-
-  network_name       = "protecho-network"
-  subnet_name        = "protecho-network-subnet"
-  ip_cidr_range      = "10.0.0.0/16"
-  pods_cidr_range    = "10.20.0.0/20"
-  services_cidr_range = "10.24.0.0/20"
+# -----------------------------------------------------
+# Module 1: Network Infrastructure
+# -----------------------------------------------------
+module "network" {
+  source              = "./modules/network"
+  region              = var.region
+  vpc_name            = var.vpc_name
+  subnet_name         = var.subnet_name
+  ip_cidr_range       = var.ip_cidr_range
+  pods_cidr_range     = var.pods_cidr_range
+  services_cidr_range = var.services_cidr_range
 }
 
-module "gke" {
-  source = "./modules/gke-cluster"
-
-  project_id  = var.project_id
-  region      = var.region
-  zone        = var.zone
-
-  # wire network/subnet from networking module outputs
-  network     = module.networking.network_self_link
-  subnetwork  = module.networking.subnet_self_link
-
-  cluster_name = "protecho-gke"
-}
-
-module "node_pools" {
-  source = "./modules/node-pools"
-
-  project_id   = var.project_id
-  region       = var.region
-  zone         = var.zone
-  cluster_name = module.gke.cluster_name
-}
-
-# TiDB module is optional; controlled by enable_tidb
-module "tidb" {
-  source = "./modules/tidb"
-  count  = var.enable_tidb ? 1 : 0
-
-  project_id     = var.project_id
-  region         = var.region
-  zone           = var.zone
-  cluster_name   = module.gke.cluster_name
-  tidb_yaml_path = var.tidb_yaml_path
-
-  depends_on = [module.gke]
-}
-
-# After cluster creation, configure providers that need cluster endpoint/CA:
-data "google_client_config" "default" {}
-
-data "google_container_cluster" "gke" {
-  name     = module.gke.cluster_name
-  location = var.region
-  depends_on = [module.gke]
-}
-
-provider "kubernetes" {
-  host = "https://${data.google_container_cluster.gke.endpoint}"
-  token = data.google_client_config.default.access_token
-  cluster_ca_certificate = base64decode(data.google_container_cluster.gke.master_auth[0].cluster_ca_certificate)
-  load_config_file = false
-}
-
-provider "kubectl" {
-  host = "https://${data.google_container_cluster.gke.endpoint}"
-  token = data.google_client_config.default.access_token
-  cluster_ca_certificate = base64decode(data.google_container_cluster.gke.master_auth[0].cluster_ca_certificate)
-  load_config_file = false
-}
-
-provider "helm" {
-  kubernetes = {
-    host = "https://${data.google_container_cluster.gke.endpoint}"
-    token = data.google_client_config.default.access_token
-    cluster_ca_certificate = base64decode(data.google_container_cluster.gke.master_auth[0].cluster_ca_certificate)
+# -----------------------------------------------------
+# Module 2: GKE Cluster
+# -----------------------------------------------------
+module "gke_cluster" {
+  source          = "./modules/gke-cluster"
+  region          = var.region
+  zone            = var.zone
+  cluster_name    = var.cluster_name
+  network_name    = module.network.vpc_name
+  subnetwork_name = module.network.subnet_name
+  
+  pods_range_name     = module.network.pods_range_name
+  services_range_name = module.network.services_range_name
+  
+  admin_count     = var.admin_count
+  tidb_config     = {
+    count        = var.tidb_count
+    machine_type = var.tidb_machine_type
+    disk_gb      = var.tidb_disk_gb
   }
+  pd_config       = {
+    count        = var.pd_count
+    machine_type = var.pd_machine_type
+    disk_gb      = var.pd_disk_gb
+  }
+  tikv_config     = {
+    count        = var.tikv_count
+    machine_type = var.tikv_machine_type
+    disk_gb      = var.tikv_disk_gb
+  }
+  bignode_count = var.bignode_count
+
+  depends_on = [module.network]
+}
+
+
+
+
+data "google_container_cluster" "primary" {
+  name     = module.gke_cluster.gke_name
+  location = var.region
+  
+  # Ensure the data source explicitly waits for the GKE cluster resource to be created.
+  depends_on = [
+    module.gke_cluster
+  ]
+}
+# -----------------------------------------------------
+# Module 3: TiDB Application Deployment
+# -----------------------------------------------------
+
+module "tidb_app" {
+  source            = "./modules/tidb-app"
+  tidb_cluster_yaml = file("./tidb-yamls/tidb-cluster.yaml") # Using file() instead of var.tidb_yaml_path/tidb-cluster.yaml
+ 
+  # Explicitly pass the provider configuration to the module
+  providers = {
+    kubectl    = kubectl
+    kubernetes = kubernetes
+    helm       = helm
+  }
+  depends_on = [
+    # Ensures the GKE cluster creation finishes before anything in this module starts
+    module.gke_cluster 
+  ]
+}# Create Artifact Registry Repository (Must happen first)
+resource "google_artifact_registry_repository" "destination_repo" {
+  repository_id = var.artifact_registry_repo
+  location      = var.ar_region  
+  format        = "DOCKER"
+  description   = "Docker image repository for mirroring dell-harbor.protecto.ai assets."
+  project       = var.project_id
+}
+
+# -----------------------------------------------------
+# Pull Images from Harbor (Source: dell-harbor.protecto.ai)
+# -----------------------------------------------------
+resource "docker_image" "private_apps" {
+  for_each = var.application_images
+  name = each.value # The Harbor address
+  
+  keep_locally = false
+  pull_triggers = [
+    timestamp()
+  ]
+}
+
+# -----------------------------------------------------
+# Tag Images for Artifact Registry (Rename)
+# -----------------------------------------------------
+resource "docker_tag" "registry_tags" {
+  for_each = var.application_images
+  
+  # Source Image ID comes from the pull operation
+  source_image = docker_image.private_apps[each.key].image_id
+  
+  # Target Image is the full AR path (Host/Project/Repo/Name:Tag)
+  target_image = "${var.artifact_registry_host}/${var.project_id}/${var.artifact_registry_repo}/${each.key}:${split(":", each.value)[1]}"
+  
+  # Implicit dependency on docker_image.private_apps ensures pull completes before tagging starts
+  depends_on = [docker_image.private_apps] 
+}
+
+# -----------------------------------------------------
+# Push Images to Artifact Registry (Destination)
+# -----------------------------------------------------
+resource "docker_image" "artifact_pushes" {
+  for_each = var.application_images
+  
+  # Name is the newly tagged AR path
+  name = docker_tag.registry_tags[each.key].target_image
+
+  # keep_locally = false triggers the implicit push
+  keep_locally = false
+  
+  triggers = {
+    digest = docker_image.private_apps[each.key].image_id
+  }
+  
+  # CRITICAL DEPENDENCY: Ensure repository is created before attempting to push
+  depends_on = [
+    google_artifact_registry_repository.destination_repo 
+  ]
 }
